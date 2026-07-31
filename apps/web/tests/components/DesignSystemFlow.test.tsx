@@ -47,15 +47,27 @@ vi.mock('../../src/components/ChatPane', () => ({
     initialDraft,
     onNewConversation,
     onSend,
+    projectFileNames,
+    onRequestOpenFile,
   }: {
     error?: string | null;
     initialDraft?: string;
     onNewConversation?: () => void;
     onSend: (prompt: string, attachments: unknown[], commentAttachments: unknown[]) => void;
+    projectFileNames?: Set<string>;
+    onRequestOpenFile?: (name: string) => void;
   }) => (
     <>
       {error ? <div role="alert">{error}</div> : null}
       {initialDraft ? <div data-testid="chat-initial-draft">{initialDraft}</div> : null}
+      <div data-testid="chat-file-names">{[...(projectFileNames ?? [])].join(',')}</div>
+      <button
+        type="button"
+        data-testid="chat-open-file"
+        onClick={() => onRequestOpenFile?.('index.html')}
+      >
+        open file
+      </button>
       <button
         type="button"
         data-testid="new-conversation"
@@ -75,7 +87,10 @@ vi.mock('../../src/components/ChatPane', () => ({
 }));
 
 vi.mock('../../src/components/FileWorkspace', () => ({
-  FileWorkspace: () => <div data-testid="design-system-files" />,
+  DESIGN_SYSTEM_TAB: '__design_system__',
+  FileWorkspace: ({ openRequest }: { openRequest?: { name: string } | null }) => (
+    <div data-testid="design-system-files" data-open-request={openRequest?.name ?? ''} />
+  ),
 }));
 
 vi.mock('../../src/providers/daemon', () => ({
@@ -167,7 +182,8 @@ function continueToGeneration() {
 }
 
 function confirmExtraction() {
-  fireEvent.click(screen.getByRole('button', { name: /extract design system/i }));
+  const button = screen.queryByRole('button', { name: /extract design system/i });
+  if (button) fireEvent.click(button);
 }
 
 function addSourceUrl(value: string) {
@@ -180,7 +196,7 @@ function addSourceUrl(value: string) {
 function mockBrandExtractProject(project: Project) {
   mocks.getProject.mockResolvedValue(project);
   const designSystemId = project.designSystemId ?? `user:${project.id}`;
-  const fetchMock = vi.fn(async (input: unknown) => {
+  const fetchMock = vi.fn(async (input: unknown, _init?: unknown) => {
     if (typeof input === 'string' && input.startsWith('/api/brands')) {
       return {
         ok: true,
@@ -378,7 +394,7 @@ describe('DesignSystemCreationFlow', () => {
       target: { value: 'https://acme.com' },
     });
     continueToGeneration();
-    fireEvent.click(screen.getByRole('button', { name: /extract design system/i }));
+    confirmExtraction();
 
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith(project.id, project, 'conv-acme'));
     expect(fetchMock).toHaveBeenCalledWith('/api/brands', expect.objectContaining({ method: 'POST' }));
@@ -388,6 +404,64 @@ describe('DesignSystemCreationFlow', () => {
     // The legacy 5-step pipeline must no longer run.
     expect(mocks.createDesignSystemDraft).not.toHaveBeenCalled();
     expect(mocks.ensureDesignSystemWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('keeps GitHub-only source links out of website brand extraction', async () => {
+    const project: Project = {
+      id: 'brand-github',
+      name: 'GitHub Design System',
+      skillId: 'brand-extract',
+      designSystemId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      metadata: { kind: 'brand', importedFrom: 'brand-extraction' },
+    };
+    const fetchMock = mockBrandExtractProject(project);
+    const onCreated = vi.fn();
+
+    render(<DesignSystemCreationFlow onBack={() => {}} onCreated={onCreated} />);
+
+    addSourceUrl('git@github.com:nexu-io/open-design.git');
+    continueToGeneration();
+    confirmExtraction();
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    const requestInit = fetchMock.mock.calls.find(([url]) => url === '/api/brands')?.[1] as
+      | { body: string }
+      | undefined;
+    expect(requestInit).toBeTruthy();
+    const body = JSON.parse(requestInit!.body) as { url?: string; designMd?: string };
+    expect(body.url).toBeUndefined();
+    expect(body.designMd).toEqual(expect.stringContaining('https://github.com/nexu-io/open-design'));
+    expect(body.designMd).toEqual(expect.stringContaining('GitHub repositories: https://github.com/nexu-io/open-design'));
+  });
+
+  it('keeps protocol-less website paths as website URLs', async () => {
+    const project: Project = {
+      id: 'brand-example',
+      name: 'Example Design System',
+      skillId: 'brand-extract',
+      designSystemId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      metadata: { kind: 'brand', importedFrom: 'brand-extraction' },
+    };
+    const fetchMock = mockBrandExtractProject(project);
+
+    render(<DesignSystemCreationFlow onBack={() => {}} onCreated={() => {}} />);
+
+    addSourceUrl('example.com/pricing');
+    continueToGeneration();
+    confirmExtraction();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/brands', expect.anything()));
+    const requestInit = fetchMock.mock.calls.find(([url]) => url === '/api/brands')?.[1] as
+      | { body: string }
+      | undefined;
+    expect(requestInit).toBeTruthy();
+    expect(JSON.parse(requestInit!.body)).toMatchObject({
+      url: 'https://example.com/pricing',
+    });
   });
 
   it('creates from pasted DESIGN.md without requiring a website', async () => {
@@ -444,7 +518,7 @@ describe('DesignSystemCreationFlow', () => {
       (screen.getByRole('button', { name: /continue to generation/i }) as HTMLButtonElement).disabled,
     ).toBe(false);
     continueToGeneration();
-    fireEvent.click(screen.getByRole('button', { name: /extract design system/i }));
+    confirmExtraction();
 
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith(project.id, project, 'conv-heritage'));
     const requestInit = fetchMock.mock.calls.find(([url]) => url === '/api/brands')?.[1] as unknown as { body: string };
@@ -581,7 +655,7 @@ describe('DesignSystemCreationFlow', () => {
       (screen.getByRole('button', { name: /continue to generation/i }) as HTMLButtonElement).disabled,
     ).toBe(false);
     continueToGeneration();
-    fireEvent.click(screen.getByRole('button', { name: /extract design system/i }));
+    confirmExtraction();
 
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith(project.id, project, 'conv-description-only'));
     const requestInit = fetchMock.mock.calls.find(([url]) => url === '/api/brands')?.[1] as unknown as { body: string };
@@ -615,9 +689,11 @@ describe('DesignSystemCreationFlow', () => {
       (screen.getByRole('button', { name: /continue to generation/i }) as HTMLButtonElement).disabled,
     ).toBe(false);
     continueToGeneration();
-    fireEvent.click(screen.getByRole('button', { name: /extract design system/i }));
+    confirmExtraction();
 
-    await waitFor(() => expect(screen.getByText(/could not start the extraction/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getAllByText('url is required').length).toBeGreaterThan(0));
+    const toast = document.querySelector('.od-toast.placement-top.tone-error');
+    expect(toast?.textContent).toContain('url is required');
     expect(onCreated).not.toHaveBeenCalled();
   });
 
@@ -1481,8 +1557,11 @@ describe('DesignSystemCreationFlow', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText(/Could not read one or more dropped files or folders/)).toBeTruthy();
+      expect(screen.getAllByText(/Could not read one or more dropped files or folders/).length).toBeGreaterThan(0);
     });
+    expect(document.querySelector('.od-toast.placement-top.tone-error')?.textContent).toContain(
+      'Could not read one or more dropped files or folders',
+    );
     expect(screen.queryByText(/local code files selected/)).toBeNull();
   });
 
@@ -2390,6 +2469,91 @@ describe('DesignSystemCreationFlow', () => {
 });
 
 describe('DesignSystemDetailView', () => {
+  it('opens chat file links through the Files tab workspace (#5611 round 9)', async () => {
+    // The design-system chat must thread the workspace's known-file set and
+    // an opener into ChatPane; without them a current-project file link is
+    // classified but the click stays inert (opener undefined). The opener
+    // must also switch to the Files tab, where the FileWorkspace consuming
+    // the open request actually mounts.
+    const system: DesignSystemDetail = {
+      id: 'user:acme-design-system',
+      title: 'Acme Design System',
+      category: 'Custom',
+      summary: 'Acme product workspace.',
+      swatches: [],
+      surface: 'web',
+      body: '# Acme Design System\n',
+      source: 'user',
+      status: 'draft',
+      isEditable: true,
+      projectId: 'ds-acme-design-system',
+    };
+    const project: Project = {
+      id: 'ds-acme-design-system',
+      name: 'Acme Design System',
+      skillId: null,
+      designSystemId: system.id,
+      createdAt: 1,
+      updatedAt: 1,
+      metadata: {
+        kind: 'other',
+        importedFrom: 'design-system',
+        entryFile: 'DESIGN.md',
+        sourceFileName: system.id,
+      },
+    };
+    const workspaceFile: ProjectFile = {
+      name: 'index.html',
+      path: 'index.html',
+      type: 'file',
+      size: 100,
+      mtime: 1,
+      kind: 'html',
+      mime: 'text/html',
+    };
+    const config: AppConfig = {
+      mode: 'daemon',
+      apiKey: '',
+      baseUrl: '',
+      model: '',
+      agentId: 'agent-1',
+      agentModels: {},
+      skillId: null,
+      designSystemId: null,
+    };
+
+    mocks.fetchDesignSystem.mockResolvedValue(system);
+    mocks.ensureDesignSystemWorkspace.mockResolvedValue({ project, files: [workspaceFile] });
+    mocks.listConversations.mockResolvedValue([
+      { id: 'conv-design-system', projectId: project.id, title: 'Design system', createdAt: 1, updatedAt: 1 },
+    ]);
+
+    render(
+      <DesignSystemDetailView
+        id={system.id}
+        selectedId={system.id}
+        config={config}
+        agents={[{ id: 'agent-1', name: 'OpenCode', bin: 'opencode', available: true, models: [] }]}
+        onBack={() => {}}
+        onSetDefault={() => {}}
+      />,
+    );
+
+    await screen.findByText('Acme Design System');
+
+    // The known-file set reaches the chat pane…
+    await waitFor(() =>
+      expect(screen.getByTestId('chat-file-names').textContent).toContain('index.html'),
+    );
+
+    // …and the opener switches to the Files tab and hands the workspace the
+    // open request.
+    expect(screen.queryByTestId('design-system-files')).toBeNull();
+    fireEvent.click(screen.getByTestId('chat-open-file'));
+    const workspace = await screen.findByTestId('design-system-files');
+    expect(workspace.getAttribute('data-open-request')).toBe('index.html');
+  });
+
   it('does not silently seed audit repair prompts into the composer after manual runs', async () => {
     const system: DesignSystemDetail = {
       id: 'user:acme-design-system',
